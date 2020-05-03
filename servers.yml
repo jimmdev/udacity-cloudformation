@@ -1,0 +1,209 @@
+Description: >
+  Creates the cloudformation stack containing the servers and loadbalacers for Udagram
+
+Parameters:
+  EnvironmentName:
+    Type: String
+  # key pair is parameterized to easily change the key pair
+  KeyPair:
+    Type: String
+  # parameterized to easily scale vertically
+  InstanceType:
+    Type: String
+    # t3.medium comes with 2 vCPUs and 4 GB of RAM
+    Default: t3.medium
+  # parameterized to easily change / update the base image
+  BaseImage:
+    Type: String
+    # Default as requested: ubuntu 18
+    Default: ami-003634241a8fcdec0
+  # parameterized to easily scale horizontally
+  MaxNumberOfInstances:
+    Type: String
+  # parameterized to easily increase storage
+  EBSVolumeSize:
+    Type: String
+    # Minumum of 10 GB was required
+    Default: '10'
+  # parameterized in case the timeout changes
+  HealthCheckIntervalSeconds:
+    Type: Number
+  # parameterized in case the application grows and needs longer to respond
+  HealthCheckTimeoutSeconds:
+    Type: Number
+
+Resources:
+
+  # this is the role which has the read-only-s3 policy attached
+  UdacityS3ReadOnlyEC2:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: 
+      - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  # Profile to be used in the EC2 instance
+  InstanceProfileWithS3Access:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles:
+      - !Ref UdacityS3ReadOnlyEC2
+
+  # The security group for the server runnung Udagram
+  UdagramServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http (port 80) and unlimited outgoing traffic
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPC"
+      # that's where the Udagram should be runnning
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      # outgoing traffic is not limited, as different servers need to be
+      # reached for installation and code download
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+  
+  # The launch config defines the instance details and the launch script
+  UdagramServerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update -y
+          apt-get install unzip awscli -y
+          apt-get install apache2 -y
+          systemctl start apache2.service
+          cd /var/www/html
+          aws s3 cp s3://udacity-demo-1/udacity.zip .
+          unzip -o udacity.zip
+      ImageId: !Ref BaseImage
+      IamInstanceProfile: !Ref InstanceProfileWithS3Access
+      KeyName: !Ref KeyPair
+      SecurityGroups:
+      - Ref: UdagramServerSecGroup
+      InstanceType: !Ref InstanceType
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: !Ref EBSVolumeSize
+  
+  # Autoscaling group defines how many servers shall run
+  UdagramServerAutoscalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      # Servers shall be put in the private nets
+      VPCZoneIdentifier:
+      - Fn::ImportValue:
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: UdagramServerLaunchConfig
+      # At least to to scale down to minumum (1 per AZ)
+      MinSize: '2'
+      MaxSize: !Ref MaxNumberOfInstances
+      TargetGroupARNs:
+      - Ref: UdagramTargetGroup
+
+  # Security group for the load balancer
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow only http traffic inbound and outbound on port 80
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPC"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      # outbound also limited to port 80
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  # The loadbanlacer itself, balancing between the two public sub nets
+  UdagramLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+
+  # The config for the loadbanlancer when and where to check
+  UdagramTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: !Ref HealthCheckTimeoutSeconds
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPC"
+
+  # The listener on the loadbalancer for our udagram servers
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: UdagramTargetGroup
+      LoadBalancerArn:
+        Ref: UdagramLB
+      Port: '80'
+      Protocol: HTTP
+
+  # And the listern roule with it's priority
+  ALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+      - Type: forward
+        TargetGroupArn: !Ref 'UdagramTargetGroup'
+      Conditions:
+      - Field: path-pattern
+        Values: [/]
+      ListenerArn: !Ref 'Listener'
+      Priority: 1
+
+Outputs:
+
+  # The S3 role is exported for potential further use in other components
+  UdacityS3ReadOnlyEC2:
+    Description: A reference to role that is used to access S3
+    Value: !Ref UdacityS3ReadOnlyEC2
+    Export:
+      Name: !Sub ${EnvironmentName}-S3-Read-Role
+
+  # The loadbalancer DNS is exported to easily access the DNS
+  UdagramLB:
+    Description: The DNS of the loadbalancer to reach the application
+    Value: !Sub http://${UdagramLB.DNSName}
+    Export:
+      Name: !Sub ${EnvironmentName}-LoadBalancer-DNS
