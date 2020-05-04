@@ -4,9 +4,6 @@ Description: >
 Parameters:
   EnvironmentName:
     Type: String
-  # key pair is parameterized to easily change the key pair
-  KeyPair:
-    Type: String
   # parameterized to easily scale vertically
   InstanceType:
     Type: String
@@ -95,7 +92,6 @@ Resources:
           unzip -o udacity.zip
       ImageId: !Ref BaseImage
       IamInstanceProfile: !Ref InstanceProfileWithS3Access
-      KeyName: !Ref KeyPair
       SecurityGroups:
       - Ref: UdagramServerSecGroup
       InstanceType: !Ref InstanceType

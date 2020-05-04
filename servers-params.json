@@ -4,10 +4,6 @@
         "ParameterValue": "UdagramIACProject"
     },
     {
-        "ParameterKey": "KeyPair",
-        "ParameterValue": "udagram-key"
-    },
-    {
         "ParameterKey": "InstanceType",
         "ParameterValue": "t3.medium"
     },
